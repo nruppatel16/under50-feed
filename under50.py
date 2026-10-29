@@ -23,14 +23,12 @@ it is over 30 days old or has more than 100 applicants (rows with a status
 or notes filled in are kept).
 
 New jobs are read one by one from LinkedIn's public job page for their
-applicant count, seniority level, industry and whether they're remote, and
-added if under 50 applicants and not senior (by title, or LinkedIn's
-Director / Executive levels). A clearly-IT title (it_roles.STRONG_IT) always
-counts as IT; a loosely-IT one ("Technician", "Engineer", "Solutions…") only
-when the employer's industry is tech or the job function is IT. The same
-company, title and province is listed once. LinkedIn's public search ignores its
-job-function, experience-level and remote filters, so all three are applied
-here instead.
+applicant count, seniority level and whether they're remote, and added if
+under 50 applicants and not senior (by title, or LinkedIn's Director /
+Executive levels). Every IT-related title counts (it_roles.is_it_role,
+loosely-IT ones like "Technician" or "Solutions…" included), at any
+company. The same company, title and province is listed once. LinkedIn's public search ignores its
+experience-level and remote filters, so both are applied here instead.
 
 Settings (environment): UNDER50_SHEET_ID, and GOOGLE_CREDENTIALS (the
 service account's JSON key) or GOOGLE_CREDENTIALS_FILE (path to it).
@@ -48,7 +46,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from it_roles import _STRONG, SEARCH_TERMS, is_it_role
+from it_roles import SEARCH_TERMS, is_it_role
 
 TAB = "Under 50"
 MAX_APPLICANTS = 50       # add jobs with fewer than this
@@ -113,13 +111,6 @@ SEARCH_URL = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/se
 JOB_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{}"
 _APPLICANTS_RE = re.compile(r'num-applicants__caption[^>]*>\s*([^<]+?)\s*<', re.S)
 _LEVEL_RE = re.compile(r'Seniority level\s*</h3>\s*<span[^>]*>\s*([^<]+?)\s*<', re.S)
-_FUNCTION_RE = re.compile(r'Job function\s*</h3>\s*<span[^>]*>\s*([^<]+?)\s*<', re.S)
-_INDUSTRY_RE = re.compile(r'Industries\s*</h3>\s*<span[^>]*>\s*([^<]+?)\s*<', re.S)
-# A title that's only loosely IT ("Technician", "Engineer", "Solutions…") counts
-# when the employer is in tech, or LinkedIn files the job under IT.
-TECH_INDUSTRY_RE = re.compile(
-    r"software|information technology|IT services|IT system|computer|internet|information services|"
-    r"telecommunications|wireless services|semiconductor|cyber|data infrastructure|technology, information", re.I)
 _LI_ID_RE = re.compile(r"/jobs/view/(?:[^/?]*-)?(\d+)")
 TORONTO = timezone(timedelta(hours=-4))
 
@@ -222,16 +213,13 @@ def search(keywords, place, seconds, max_pages):
 
 def job_page(job_id):
     """What the public job page says: applicant count (None if it didn't show
-    one: closed, or never answered), seniority level, job function, remote."""
+    one: closed, or never answered), seniority level, and whether it's remote."""
     r = _get(JOB_URL.format(job_id))
     if r is None or r.status_code != 200:
-        return {"applicants": None, "level": "", "it": False, "remote": False}
+        return {"applicants": None, "level": "", "remote": False}
     m, lv = _APPLICANTS_RE.search(r.text), _LEVEL_RE.search(r.text)
-    fn, ind = _FUNCTION_RE.search(r.text), _INDUSTRY_RE.search(r.text)
     return {"applicants": parse_applicants(m.group(1)) if m else None,
             "level": lv.group(1) if lv else "",
-            "it": bool((fn and "Information Technology" in fn.group(1))
-                       or (ind and TECH_INDUSTRY_RE.search(ind.group(1)))),
             "remote": bool(REMOTE_PAGE_RE.search(r.text))}
 
 
@@ -256,7 +244,7 @@ def search_all(searches, kind, found):
                     continue
                 if kind == "canada" and not (in_canada or REMOTE_RE.search(j["location"])):
                     continue  # Canada searches occasionally return US-only jobs
-                found[j["id"]] = {**j, "strong_it": bool(_STRONG.search(title)), "in_canada": in_canada,
+                found[j["id"]] = {**j, "in_canada": in_canada,
                                   "remote_card": bool(REMOTE_RE.search(f"{title} {j['location']}"))}
             done[0] += 1
             if done[0] % 100 == 0:
@@ -416,7 +404,7 @@ def cycle(terms=None):
     # The same posting in several cities is listed once.
     listed_keys = {(r["company"], r["role"], r["province"]) for r in tab.rows()}
     jobs, why = [], {"no applicant count": 0, "50+ applicants": 0, "Director/Executive": 0,
-                     "not IT": 0, "not remote, outside Canada": 0, "duplicate": 0}
+                     "not remote, outside Canada": 0, "duplicate": 0}
     for jid in new:
         j, p = found[jid], pages[jid]
         if p["applicants"] is None:
@@ -424,7 +412,6 @@ def cycle(terms=None):
             continue  # maybe next time
         remote_worldwide = not j["in_canada"]
         reason = ("Director/Executive" if p["level"] in SENIOR_LEVELS
-                  else "not IT" if not (j["strong_it"] or p["it"])
                   else "not remote, outside Canada" if remote_worldwide and not (j["remote_card"] or p["remote"])
                   else "50+ applicants" if p["applicants"] >= MAX_APPLICANTS else None)
         if reason:
