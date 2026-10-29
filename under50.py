@@ -19,8 +19,8 @@ The first ever cycle (or one after more than a week without one) instead
 does the full search: every IT term in Canada and in each province and
 territory over the last 30 days, plus (3) over 30 days.
 Every 4 hours the jobs already listed are re-checked; a job is removed once
-it is over 30 days old or has more than 100 applicants (rows with a status
-or notes filled in are kept).
+it is over 30 days old, has more than 100 applicants, or LinkedIn says it's
+no longer accepting applications.
 
 New jobs are read one by one from LinkedIn's public job page for their
 applicant count, seniority level and whether they're remote, and added if
@@ -60,9 +60,12 @@ DATA = Path(__file__).parent / "data"
 STATE_PATH = DATA / "state.json"      # when the last full search / search / re-check finished
 RULED_OUT_PATH = DATA / "ruled_out.json"  # LinkedIn ids that can never qualify (50+ applicants, senior, not IT, not remote)
 
-COLS = ["id", "company", "role", "level", "location", "province", "posted_date", "days_ago",
-        "window", "applicants", "apply_url", "status", "notes", "checked_at", "discovered_at"]
-USER_COLS = ("status", "notes")  # never delete a row someone has written in
+# Same first columns as Job Scout's Jobs tab, then the Under 50 details.
+COLS = ["Posted", "Company", "Title", "Location", "Source", "Link", "Found",
+        "Applicants", "Province", "Days ago", "Window", "Last checked"]
+# The tab's first layout; converted to COLS when found.
+OLD_COLS = ["id", "company", "role", "level", "location", "province", "posted_date", "days_ago",
+            "window", "applicants", "apply_url", "status", "notes", "checked_at", "discovered_at"]
 
 PLACES = [
     "Canada", "Ontario, Canada", "Quebec, Canada", "British Columbia, Canada", "Alberta, Canada",
@@ -111,6 +114,8 @@ SEARCH_URL = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/se
 JOB_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{}"
 _APPLICANTS_RE = re.compile(r'num-applicants__caption[^>]*>\s*([^<]+?)\s*<', re.S)
 _LEVEL_RE = re.compile(r'Seniority level\s*</h3>\s*<span[^>]*>\s*([^<]+?)\s*<', re.S)
+_POSTED_RE = re.compile(r'posted-time-ago__text[^>]*>\s*([^<]+?)\s*<', re.S)
+_CLOSED_RE = re.compile(r"No longer accepting applications", re.I)
 _LI_ID_RE = re.compile(r"/jobs/view/(?:[^/?]*-)?(\d+)")
 TORONTO = timezone(timedelta(hours=-4))
 
@@ -164,6 +169,20 @@ def window(days):
     return "Last week" if days <= WEEK_DAYS else "Last month"
 
 
+def now_text():
+    return datetime.now(TORONTO).strftime("%Y-%m-%d %H:%M")
+
+
+def posted_time(ago):
+    """'5 hours ago' -> 'YYYY-MM-DD HH:MM' (Toronto); None for anything coarser
+    than hours, where the search card's date is all there is."""
+    m = re.search(r"(\d+)\s+(minute|hour)s?\s+ago", ago or "", re.I)
+    if not m:
+        return None
+    delta = timedelta(**{m.group(2).lower() + "s": int(m.group(1))})
+    return (datetime.now(TORONTO) - delta).strftime("%Y-%m-%d %H:%M")
+
+
 # ── LinkedIn ──────────────────────────────────────────────────────────────
 
 def _get(url, params=None):
@@ -213,14 +232,17 @@ def search(keywords, place, seconds, max_pages):
 
 def job_page(job_id):
     """What the public job page says: applicant count (None if it didn't show
-    one: closed, or never answered), seniority level, and whether it's remote."""
+    one, or never answered), seniority level, posting time (when LinkedIn
+    gives it to the hour), whether it's remote, and whether it has closed."""
     r = _get(JOB_URL.format(job_id))
     if r is None or r.status_code != 200:
-        return {"applicants": None, "level": "", "remote": False}
-    m, lv = _APPLICANTS_RE.search(r.text), _LEVEL_RE.search(r.text)
+        return {"applicants": None, "level": "", "posted": None, "remote": False, "closed": False}
+    m, lv, ago = _APPLICANTS_RE.search(r.text), _LEVEL_RE.search(r.text), _POSTED_RE.search(r.text)
     return {"applicants": parse_applicants(m.group(1)) if m else None,
             "level": lv.group(1) if lv else "",
-            "remote": bool(REMOTE_PAGE_RE.search(r.text))}
+            "posted": posted_time(ago.group(1)) if ago else None,
+            "remote": bool(REMOTE_PAGE_RE.search(r.text)),
+            "closed": bool(_CLOSED_RE.search(r.text))}
 
 
 def search_all(searches, kind, found):
@@ -291,15 +313,65 @@ def open_sheet():
 
 
 class Tab:
+    """The Under 50 tab, newest posting first. Dates are written as text
+    ('YYYY-MM-DD HH:MM', or just the date when LinkedIn gives no time), so the
+    tab sorts and reads the same however the sheet is set to show dates."""
+
     def __init__(self, spreadsheet):
         self.spreadsheet = spreadsheet
-        if TAB in [ws.title for ws in spreadsheet.worksheets()]:
-            self.ws = spreadsheet.worksheet(TAB)
-        else:
+        if TAB not in [ws.title for ws in spreadsheet.worksheets()]:
             self.ws = spreadsheet.add_worksheet(title=TAB, rows=1000, cols=len(COLS))
-            self.ws.append_row(COLS)
-            self.ws.freeze(rows=1)
+            self._write([])
             log(f"Created tab: {TAB}")
+            return
+        self.ws = spreadsheet.worksheet(TAB)
+        header = self.ws.row_values(1)
+        if header[:len(OLD_COLS)] == OLD_COLS:
+            self._migrate()
+        elif header != COLS:
+            sys.exit(f"The {TAB} tab's header isn't {COLS}; not touching it.")
+
+    def _migrate(self):
+        old = [dict(zip(OLD_COLS, v + [""] * (len(OLD_COLS) - len(v)))) for v in self.ws.get_all_values()[1:]]
+        rows = [{"Posted": r["posted_date"], "Company": r["company"], "Title": r["role"],
+                 "Location": r["location"], "Source": "LinkedIn", "Link": r["apply_url"],
+                 "Found": r["discovered_at"], "Applicants": r["applicants"], "Province": r["province"],
+                 "Days ago": r["days_ago"], "Window": r["window"], "Last checked": r["checked_at"]}
+                for r in old if r["apply_url"]]
+        self._write(rows)
+        log(f"Converted {len(rows)} rows to the new layout")
+
+    def _write(self, rows):
+        """Replace the whole tab with the header and rows, and format it."""
+        self.ws.clear()
+        self.ws.resize(rows=max(len(rows) + 100, 1000), cols=len(COLS))
+        self.ws.update([COLS] + [self._values(r) for r in sorted(rows, key=lambda r: r["Posted"], reverse=True)],
+                       "A1", value_input_option="USER_ENTERED")
+        col = {c: i for i, c in enumerate(COLS)}
+        width = lambda c, px: {"updateDimensionProperties": {
+            "range": {"sheetId": self.ws.id, "dimension": "COLUMNS", "startIndex": col[c], "endIndex": col[c] + 1},
+            "properties": {"pixelSize": px}, "fields": "pixelSize"}}
+        self.spreadsheet.batch_update({"requests": [
+            {"repeatCell": {"range": {"sheetId": self.ws.id, "startRowIndex": 0, "endRowIndex": 1},
+                            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                            "fields": "userEnteredFormat.textFormat.bold"}},
+            {"updateSheetProperties": {"properties": {"sheetId": self.ws.id, "gridProperties": {"frozenRowCount": 1}},
+                                       "fields": "gridProperties.frozenRowCount"}},
+            width("Posted", 150), width("Title", 320), width("Link", 260), width("Found", 150),
+            width("Last checked", 150),
+            # Like the Jobs tab: Posted turns green for postings from the last day.
+            {"addConditionalFormatRule": {"index": 0, "rule": {
+                "ranges": [{"sheetId": self.ws.id, "startRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 1}],
+                "booleanRule": {"condition": {"type": "CUSTOM_FORMULA",
+                                              "values": [{"userEnteredValue": "=AND($A2<>\"\", $J2=0)"}]},
+                                "format": {"backgroundColor": {"red": 0.902, "green": 0.957, "blue": 0.918}}}}}},
+        ]})
+
+    @staticmethod
+    def _values(r):
+        text = lambda v: f"'{v}" if v else ""  # keep dates as typed
+        return [text(r["Posted"]), r["Company"], r["Title"], r["Location"], r["Source"], r["Link"],
+                text(r["Found"]), r["Applicants"], r["Province"], r["Days ago"], r["Window"], text(r["Last checked"])]
 
     def rows(self):
         values = self.ws.get_all_values()
@@ -309,7 +381,7 @@ class Tab:
     def update(self, rows):
         if rows:
             end = chr(ord("A") + len(COLS) - 1)
-            self.ws.batch_update([{"range": f"A{r['_row']}:{end}{r['_row']}", "values": [[r[c] for c in COLS]]}
+            self.ws.batch_update([{"range": f"A{r['_row']}:{end}{r['_row']}", "values": [self._values(r)]}
                                   for r in rows], value_input_option="USER_ENTERED")
 
     def delete(self, row_numbers):
@@ -319,12 +391,14 @@ class Tab:
                                                "startIndex": n - 1, "endIndex": n}}}
                 for n in sorted(row_numbers, reverse=True)]})
 
-    def append(self, jobs):
-        ids = [int(r["id"]) for r in self.rows() if str(r["id"]).isdigit()]
-        first = max(ids, default=0) + 1
-        rows = [[first + i] + [j.get(c, "") for c in COLS[1:]] for i, j in enumerate(jobs)]
+    def add(self, jobs):
+        """Append jobs, then re-sort the tab newest posting first."""
+        rows = [self._values(j) for j in jobs]
         for start in range(0, len(rows), 100):
             self.ws.append_rows(rows[start:start + 100], value_input_option="USER_ENTERED")
+        self.spreadsheet.batch_update({"requests": [{"sortRange": {
+            "range": {"sheetId": self.ws.id, "startRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": len(COLS)},
+            "sortSpecs": [{"dimensionIndex": 0, "sortOrder": "DESCENDING"}]}}]})
 
 
 # ── Cycle ─────────────────────────────────────────────────────────────────
@@ -344,35 +418,35 @@ def hours_since(iso):
 
 
 def recheck(tab, now_iso):
-    """Refresh listed jobs; delete ones past 30 days or 100 applicants. Returns
-    the LinkedIn ids still listed."""
+    """Refresh listed jobs; delete ones past 30 days, past 100 applicants, or no
+    longer taking applications. Returns the LinkedIn ids still listed."""
     rows = tab.rows()
-    ids = {r["_row"]: (_LI_ID_RE.search(r["apply_url"]) or [None, None])[1] for r in rows}
+    ids = {r["_row"]: (_LI_ID_RE.search(r["Link"]) or [None, None])[1] for r in rows}
     log(f"Re-checking {len(rows)} listed jobs")
     pages = job_pages([i for i in ids.values() if i])
     keep, doomed = [], []
     for r in rows:
-        n = pages.get(ids[r["_row"]], {}).get("applicants")
-        days = days_ago(r["posted_date"])
-        days = days if days is not None else int(r["days_ago"] or 0)
-        too_old_or_full = days > MAX_AGE_DAYS or (n is not None and n > REMOVE_APPLICANTS)
-        if too_old_or_full and not any(r[c].strip() for c in USER_COLS):
+        p = pages.get(ids[r["_row"]], {})
+        n = p.get("applicants")
+        days = days_ago(r["Posted"])
+        days = days if days is not None else int(r["Days ago"] or 0)
+        if days > MAX_AGE_DAYS or (n is not None and n > REMOVE_APPLICANTS) or p.get("closed"):
             doomed.append(r["_row"])
             continue
-        r["days_ago"], r["window"] = days, window(days)
+        r["Days ago"], r["Window"] = days, window(days)
         if n is not None:
-            r["applicants"], r["checked_at"] = applicants_label(n), now_iso
+            r["Applicants"], r["Last checked"] = applicants_label(n), now_iso
         keep.append(r)
     tab.update(keep)
     tab.delete(doomed)
-    log(f"Removed {len(doomed)} (over 30 days or {REMOVE_APPLICANTS}+ applicants), kept {len(keep)}")
+    log(f"Removed {len(doomed)} (over 30 days, {REMOVE_APPLICANTS}+ applicants, or closed), kept {len(keep)}")
     return {ids[r["_row"]] for r in keep if ids[r["_row"]]}
 
 
 def cycle(terms=None):
     test = terms is not None
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    now_iso = datetime.now(TORONTO).strftime("%Y-%m-%d %H:%M")
+    now_iso = now_text()
     state = {} if test else load(STATE_PATH, {})
     ruled_out = set(load(RULED_OUT_PATH, []))
     tab = Tab(open_sheet())
@@ -382,7 +456,7 @@ def cycle(terms=None):
     last_refresh = hours_since(state.get("refreshed_at"))
     refresh = full or test or last_refresh is None or last_refresh >= REFRESH_HOURS
     listed = recheck(tab, now_iso) if refresh else \
-        {m.group(1) for r in tab.rows() if (m := _LI_ID_RE.search(r["apply_url"]))}
+        {m.group(1) for r in tab.rows() if (m := _LI_ID_RE.search(r["Link"]))}
 
     terms = terms or SEARCH_TERMS
     found = {}
@@ -402,12 +476,12 @@ def cycle(terms=None):
     pages = job_pages(new)
 
     # The same posting in several cities is listed once.
-    listed_keys = {(r["company"], r["role"], r["province"]) for r in tab.rows()}
+    listed_keys = {(r["Company"], r["Title"], r["Province"]) for r in tab.rows()}
     jobs, why = [], {"no applicant count": 0, "50+ applicants": 0, "Director/Executive": 0,
                      "not remote, outside Canada": 0, "duplicate": 0}
     for jid in new:
         j, p = found[jid], pages[jid]
-        if p["applicants"] is None:
+        if p["applicants"] is None or p["closed"]:
             why["no applicant count"] += 1
             continue  # maybe next time
         remote_worldwide = not j["in_canada"]
@@ -426,14 +500,14 @@ def cycle(terms=None):
             why["duplicate"] += 1
             continue
         listed_keys.add(key)
-        jobs.append({**j, "level": p["level"], "province": key[2],
-                     "days_ago": days, "window": window(days), "applicants": applicants_label(p["applicants"]),
-                     "apply_url": f"https://www.linkedin.com/jobs/view/{jid}",
-                     "checked_at": now_iso, "discovered_at": now_iso})
-    jobs.sort(key=lambda j: j["days_ago"])
-    tab.append(jobs)
-    week = sum(j["window"] == "Last week" for j in jobs)
-    remote = sum(j["province"] == "Remote (worldwide)" for j in jobs)
+        jobs.append({"Posted": p["posted"] or j["posted_date"], "Company": j["company"], "Title": j["role"],
+                     "Location": j["location"], "Source": "LinkedIn",
+                     "Link": f"https://www.linkedin.com/jobs/view/{jid}", "Found": now_iso,
+                     "Applicants": applicants_label(p["applicants"]), "Province": key[2],
+                     "Days ago": days, "Window": window(days), "Last checked": now_iso})
+    tab.add(jobs)
+    week = sum(j["Window"] == "Last week" for j in jobs)
+    remote = sum(j["Province"] == "Remote (worldwide)" for j in jobs)
     log(f"Added {len(jobs)} ({week} last week, {len(jobs) - week} last month; {remote} remote outside Canada). "
         f"Left out: " + ", ".join(f"{v} {k}" for k, v in why.items() if v))
 
