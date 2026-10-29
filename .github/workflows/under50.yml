@@ -1,0 +1,56 @@
+name: Under 50
+
+# One run checks LinkedIn every 30 minutes for about 5 hours, then starts the
+# next run itself, so it keeps going around the clock. GitHub's own cron is
+# too irregular for a 30-minute cadence; the cron below only restarts the
+# chain if a run ever fails to start its successor.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "7 */6 * * *"
+
+concurrency:
+  group: under50
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # save data/ (state and ruled-out jobs) between cycles
+  actions: write    # start the next run
+
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      UNDER50_SHEET_ID: ${{ secrets.UNDER50_SHEET_ID }}
+      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      TZ: America/Toronto
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Check every 30 minutes for about 5 hours
+        run: |
+          git config user.name "under50 bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          deadline=$((SECONDS + 300 * 60))
+          while [ $SECONDS -lt $deadline ]; do
+            started=$SECONDS
+            python under50.py || echo "::warning::cycle failed"
+            git add data
+            if ! git diff --cached --quiet; then
+              git commit -qm "Update Under 50 state"
+              git pull -q --rebase -X theirs && git push -q || echo "::warning::couldn't save state"
+            fi
+            wait=$((30 * 60 - (SECONDS - started)))
+            [ $((SECONDS + wait)) -ge $deadline ] && break
+            [ $wait -gt 0 ] && sleep $wait
+          done
+      - name: Start the next run
+        if: success() || failure()   # not after a manual cancel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run under50.yml --ref ${{ github.ref_name }}
