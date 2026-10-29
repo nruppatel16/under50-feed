@@ -502,7 +502,7 @@ def cycle(terms=None):
         listed_keys.add(key)
         jobs.append({"Posted": p["posted"] or j["posted_date"], "Company": j["company"], "Title": j["role"],
                      "Location": j["location"], "Source": "LinkedIn",
-                     "Link": f"https://www.linkedin.com/jobs/view/{jid}", "Found": now_iso,
+                     "Link": f"https://www.linkedin.com/jobs/view/{jid}", "Found": now_text(),
                      "Applicants": applicants_label(p["applicants"]), "Province": key[2],
                      "Days ago": days, "Window": window(days), "Last checked": now_iso})
     tab.add(jobs)

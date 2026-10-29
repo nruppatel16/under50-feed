@@ -133,7 +133,8 @@ SEARCH_TERMS = [
 
 def _rx(words):
     return re.compile(
-        r"(?<![a-z0-9])(" + "|".join(re.escape(w) for w in sorted(set(words), key=len, reverse=True)) + r")(?![a-z0-9])",
+        # \w, not [a-z0-9]: accented letters are part of a word ("Préposé" isn't "pos")
+        r"(?<!\w)(" + "|".join(re.escape(w) for w in sorted(set(words), key=len, reverse=True)) + r")(?!\w)",
         re.I,
     )
 
