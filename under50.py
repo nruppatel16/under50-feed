@@ -1,26 +1,36 @@
-"""Under 50 — IT jobs anywhere in Canada with fewer than 50 applicants.
+"""Under 50 — IT jobs in Canada, or remote anywhere, with fewer than 50 applicants.
 
-Fills the "Under 50" tab of the Job Scout sheet: every IT role (see
-it_roles.py), internship to mid level, posted in the last 30 days, in any
-province, territory, town or remote-in-Canada, that LinkedIn shows with fewer
-than 50 applicants. Indeed isn't a source: it doesn't show applicant counts.
+Fills the "Under 50" tab of the Job Scout sheet: every IT role, all fields
+(see it_roles.py), internship to mid level, posted in the last 30 days, in
+any Canadian province, territory or town, or remote from anywhere in the
+world, that LinkedIn shows with fewer than 50 applicants. Indeed isn't a
+source: it doesn't show applicant counts.
 
 One run of this script is one cycle (the GitHub workflow runs it every 30
-minutes, see .github/workflows/under50.yml):
-  • First ever cycle (or after more than a week without one): the full
-    search — every IT search term in Canada and in each province and
-    territory, posted in the last 30 days.
-  • Every other cycle: every IT search term in Canada, posted since the last
-    cycle (plus two hours of overlap).
-  • Every 4 hours: re-check the jobs already listed; a job is removed once it
-    is over 30 days old or has more than 100 applicants (rows with a status
-    or notes filled in are kept).
-New jobs are read one by one from LinkedIn's public job page for their
-applicant count and seniority level, and added if under 50 applicants and
-not senior (by title, or LinkedIn's Director / Executive levels).
+minutes, see .github/workflows/under50.yml). Every cycle searches three ways
+for what was posted since the last one (plus 30 minutes of overlap):
+  1. Canada, no keywords — every job LinkedIn has, so IT jobs whose titles
+     match none of the search terms are caught too.
+  2. Canada, each IT search term — in case (1) hits LinkedIn's ~1000-result
+     cap after a long gap.
+  3. Worldwide, each IT search term + "remote" — kept only if the posting
+     says the job is remote (or it's in Canada).
+The first ever cycle (or one after more than a week without one) instead
+does the full search: every IT term in Canada and in each province and
+territory over the last 30 days, plus (3) over 30 days.
+Every 4 hours the jobs already listed are re-checked; a job is removed once
+it is over 30 days old or has more than 100 applicants (rows with a status
+or notes filled in are kept).
 
-LinkedIn's public search ignores its job-function and experience-level
-filters, so both are applied here instead.
+New jobs are read one by one from LinkedIn's public job page for their
+applicant count, seniority level, industry and whether they're remote, and
+added if under 50 applicants and not senior (by title, or LinkedIn's
+Director / Executive levels). A clearly-IT title (it_roles.STRONG_IT) always
+counts as IT; a loosely-IT one ("Technician", "Engineer", "Solutions…") only
+when the employer's industry is tech or the job function is IT. The same
+company, title and province is listed once. LinkedIn's public search ignores its
+job-function, experience-level and remote filters, so all three are applied
+here instead.
 
 Settings (environment): UNDER50_SHEET_ID, and GOOGLE_CREDENTIALS (the
 service account's JSON key) or GOOGLE_CREDENTIALS_FILE (path to it).
@@ -38,7 +48,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from it_roles import SEARCH_TERMS, is_it_role
+from it_roles import _STRONG, SEARCH_TERMS, is_it_role
 
 TAB = "Under 50"
 MAX_APPLICANTS = 50       # add jobs with fewer than this
@@ -50,7 +60,7 @@ FULL_AFTER_HOURS = WEEK_DAYS * 24   # a gap longer than this redoes the full sea
 
 DATA = Path(__file__).parent / "data"
 STATE_PATH = DATA / "state.json"      # when the last full search / search / re-check finished
-RULED_OUT_PATH = DATA / "ruled_out.json"  # LinkedIn ids with 50+ applicants or senior; never change
+RULED_OUT_PATH = DATA / "ruled_out.json"  # LinkedIn ids that can never qualify (50+ applicants, senior, not IT, not remote)
 
 COLS = ["id", "company", "role", "level", "location", "province", "posted_date", "days_ago",
         "window", "applicants", "apply_url", "status", "notes", "checked_at", "discovered_at"]
@@ -66,7 +76,11 @@ PLACES = [
 # province searches pick up what the Canada-wide one runs out before.
 FULL_PAGES = {"Canada": 30}
 FULL_PAGES_DEFAULT = 10
-RECENT_PAGES = 10
+FULL_WORLD_PAGES = 10     # worldwide remote, per term, full search
+RECENT_ALL_PAGES = 100    # Canada, no keywords: up to LinkedIn's cap
+RECENT_PAGES = 10         # Canada, per term
+RECENT_WORLD_PAGES = 5    # worldwide remote, per term
+OVERLAP_HOURS = 0.5
 
 PROVINCES = {
     "ON": "Ontario", "QC": "Quebec", "BC": "British Columbia", "AB": "Alberta", "MB": "Manitoba",
@@ -74,16 +88,24 @@ PROVINCES = {
     "PE": "Prince Edward Island", "NT": "Northwest Territories", "YT": "Yukon", "NU": "Nunavut",
 }
 _PROV_RE = re.compile(r"\b(" + "|".join(list(PROVINCES) + [re.escape(v) for v in PROVINCES.values()]) + r")\b")
-# Canada or a remote label (LinkedIn's Canada searches occasionally return US-only jobs)
-LOC_OK_RE = re.compile(r"\b(canada|remote|" + "|".join(PROVINCES) + "|"
-                       + "|".join(re.escape(v) for v in PROVINCES.values()) + r")\b", re.I)
+CANADA_RE = re.compile(r"\b(canada|" + "|".join(PROVINCES) + "|"
+                       + "|".join(re.escape(v) for v in PROVINCES.values()) + r")\b")
+# A posting that says the job is remote: its title or location, or phrases in
+# the description (LinkedIn's guest pages don't show the workplace type).
+REMOTE_RE = re.compile(
+    r"\b(remote|100% remote|fully remote|full[- ]time remote|remote[- ]first|work from anywhere|"
+    r"work from home|wfh|telecommut\w*|telework\w*|t[ée]l[ée]travail)\b", re.I)
+REMOTE_PAGE_RE = re.compile(
+    r"\b(100% remote|fully remote|full[- ]time remote|remote[- ]first|remote[- ]friendly|work from anywhere|"
+    r"remote (?:role|position|job|opportunity|work|team|company|setting|environment)|"
+    r"(?:is|be) (?:a )?remote|work(?:ing)? remotely|telecommut\w*|t[ée]l[ée]travail)\b", re.I)
 
 # Senior titles, English and French. "Manager" is senior except in
 # individual-contributor titles like Customer Success Manager.
 SENIOR_RE = re.compile(
     r"\b(senior|s[ée]nior(?:\.?e)?|sr\.?|staff|principal(?:e)?|lead|manager|director|directeur|directrice|"
     r"gestionnaire|chef|vp|vice[\s-]*pr[ée]sident(?:e)?|head\s*of|chief|cto|cio|ciso|cpo|cmo|cfo|coo|ceo|"
-    r"svp|evp|c-suite|president|founder|partner|superintendent|architect|architecte)\b", re.I)
+    r"svp|evp|c-suite|president|founder|partner|superintendent|supervisor|superviseur|architect|architecte)\b", re.I)
 IC_MANAGER_RE = re.compile(r"\b(customer success|client success|technical account|account) manager\b|\bcsm\b", re.I)
 SENIOR_LEVELS = {"Director", "Executive"}  # LinkedIn's own levels; "Mid-Senior level" stays
 
@@ -91,6 +113,13 @@ SEARCH_URL = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/se
 JOB_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{}"
 _APPLICANTS_RE = re.compile(r'num-applicants__caption[^>]*>\s*([^<]+?)\s*<', re.S)
 _LEVEL_RE = re.compile(r'Seniority level\s*</h3>\s*<span[^>]*>\s*([^<]+?)\s*<', re.S)
+_FUNCTION_RE = re.compile(r'Job function\s*</h3>\s*<span[^>]*>\s*([^<]+?)\s*<', re.S)
+_INDUSTRY_RE = re.compile(r'Industries\s*</h3>\s*<span[^>]*>\s*([^<]+?)\s*<', re.S)
+# A title that's only loosely IT ("Technician", "Engineer", "Solutions…") counts
+# when the employer is in tech, or LinkedIn files the job under IT.
+TECH_INDUSTRY_RE = re.compile(
+    r"software|information technology|IT services|IT system|computer|internet|information services|"
+    r"telecommunications|wireless services|semiconductor|cyber|data infrastructure|technology, information", re.I)
 _LI_ID_RE = re.compile(r"/jobs/view/(?:[^/?]*-)?(\d+)")
 TORONTO = timezone(timedelta(hours=-4))
 
@@ -106,11 +135,9 @@ def is_senior(title):
     return bool(SENIOR_RE.search(t))
 
 
-def wanted_title(title):
-    return is_it_role(title) and not is_senior(title)
-
-
-def province_of(location):
+def province_of(location, remote_worldwide=False):
+    if remote_worldwide:
+        return "Remote (worldwide)"
     m = _PROV_RE.search(location or "")
     if m:
         return PROVINCES.get(m.group(1), m.group(1))
@@ -194,44 +221,55 @@ def search(keywords, place, seconds, max_pages):
 
 
 def job_page(job_id):
-    """(applicant count, seniority level) from the public job page; the count is
-    None if the page didn't show one (closed, or never answered)."""
+    """What the public job page says: applicant count (None if it didn't show
+    one: closed, or never answered), seniority level, job function, remote."""
     r = _get(JOB_URL.format(job_id))
     if r is None or r.status_code != 200:
-        return None, ""
+        return {"applicants": None, "level": "", "it": False, "remote": False}
     m, lv = _APPLICANTS_RE.search(r.text), _LEVEL_RE.search(r.text)
-    return (parse_applicants(m.group(1)) if m else None), (lv.group(1) if lv else "")
+    fn, ind = _FUNCTION_RE.search(r.text), _INDUSTRY_RE.search(r.text)
+    return {"applicants": parse_applicants(m.group(1)) if m else None,
+            "level": lv.group(1) if lv else "",
+            "it": bool((fn and "Information Technology" in fn.group(1))
+                       or (ind and TECH_INDUSTRY_RE.search(ind.group(1)))),
+            "remote": bool(REMOTE_PAGE_RE.search(r.text))}
 
 
-def search_all(terms, places, seconds, pages_for):
-    """terms x places, three searches at a time. Wanted (IT, not senior,
-    Canadian) jobs keyed by LinkedIn id."""
-    found, lock, done = {}, threading.Lock(), [0]
-    pairs = [(t, p) for p in places for t in terms]
-    log(f"{len(pairs)} searches ({len(terms)} terms x {len(places)} places, last {seconds // 3600}h)")
+def search_all(searches, kind, found):
+    """Run (keywords, place, seconds, pages) searches three at a time and add
+    their candidates to found (LinkedIn id -> job): IT titles that aren't
+    senior. kind "canada" keeps Canadian (or remote-labelled) locations;
+    "world" keeps any, to be checked for remote on the job page."""
+    lock, done = threading.Lock(), [0]
+    log(f"{len(searches)} {kind} searches")
 
-    def one(pair):
-        term, place = pair
+    def one(s):
         try:
-            jobs = search(term, place, seconds, pages_for(place))
+            jobs = search(*s)
         except Exception as e:
-            log(f"  [{term} / {place}] {type(e).__name__}: {e}")
+            log(f"  [{s[0]} / {s[1]}] {type(e).__name__}: {e}")
             jobs = []
         with lock:
             for j in jobs:
-                if j["id"] not in found and wanted_title(j["role"]) and LOC_OK_RE.search(j["location"]):
-                    found[j["id"]] = j
+                title, in_canada = j["role"], bool(CANADA_RE.search(j["location"]))
+                if j["id"] in found or is_senior(title) or not is_it_role(title):
+                    continue
+                if kind == "canada" and not (in_canada or REMOTE_RE.search(j["location"])):
+                    continue  # Canada searches occasionally return US-only jobs
+                found[j["id"]] = {**j, "strong_it": bool(_STRONG.search(title)), "in_canada": in_canada,
+                                  "remote_card": bool(REMOTE_RE.search(f"{title} {j['location']}"))}
             done[0] += 1
             if done[0] % 100 == 0:
-                log(f"  {done[0]}/{len(pairs)} searches, {len(found)} jobs so far")
+                log(f"  {done[0]}/{len(searches)} {kind} searches, {len(found)} candidates so far")
 
     with ThreadPoolExecutor(max_workers=3) as pool:
-        list(pool.map(one, pairs))
+        list(pool.map(one, searches))
     return found
 
 
 def job_pages(ids):
     out, lock = {}, threading.Lock()
+    log(f"Reading {len(ids)} job pages")
 
     def one(jid):
         res = job_page(jid)
@@ -326,7 +364,7 @@ def recheck(tab, now_iso):
     pages = job_pages([i for i in ids.values() if i])
     keep, doomed = [], []
     for r in rows:
-        n = pages.get(ids[r["_row"]], (None, ""))[0]
+        n = pages.get(ids[r["_row"]], {}).get("applicants")
         days = days_ago(r["posted_date"])
         days = days if days is not None else int(r["days_ago"] or 0)
         too_old_or_full = days > MAX_AGE_DAYS or (n is not None and n > REMOVE_APPLICANTS)
@@ -358,41 +396,59 @@ def cycle(terms=None):
     listed = recheck(tab, now_iso) if refresh else \
         {m.group(1) for r in tab.rows() if (m := _LI_ID_RE.search(r["apply_url"]))}
 
+    terms = terms or SEARCH_TERMS
+    found = {}
     if full:
-        log("Full search: all of Canada and each province, last 30 days")
-        found = search_all(SEARCH_TERMS, PLACES, MAX_AGE_DAYS * 86400,
-                           lambda p: FULL_PAGES.get(p, FULL_PAGES_DEFAULT))
+        log("Full search: all of Canada and each province, plus worldwide remote, last 30 days")
+        month = MAX_AGE_DAYS * 86400
+        search_all([(t, p, month, FULL_PAGES.get(p, FULL_PAGES_DEFAULT)) for p in PLACES for t in terms], "canada", found)
+        search_all([(f"{t} remote", "Worldwide", month, FULL_WORLD_PAGES) for t in terms], "world", found)
     else:
-        hours = 24 if test else min(MAX_AGE_DAYS * 24, int(since) + 2)
-        found = search_all(terms or SEARCH_TERMS, ["Canada"], hours * 3600, lambda p: RECENT_PAGES)
+        secs = int(((24 if test else min(MAX_AGE_DAYS * 24, since)) + OVERLAP_HOURS) * 3600)
+        search_all([("", "Canada", min(secs, 3 * 3600) if test else secs, RECENT_ALL_PAGES)], "canada", found)
+        search_all([(t, "Canada", secs, RECENT_PAGES) for t in terms], "canada", found)
+        search_all([(f"{t} remote", "Worldwide", secs, RECENT_WORLD_PAGES) for t in terms], "world", found)
 
     new = [i for i in found if i not in listed and i not in ruled_out]
-    log(f"{len(found)} IT jobs found, {len(new)} new — reading their job pages")
+    log(f"{len(found)} candidates, {len(new)} new")
     pages = job_pages(new)
 
-    jobs, unknown, senior = [], 0, 0
+    # The same posting in several cities is listed once.
+    listed_keys = {(r["company"], r["role"], r["province"]) for r in tab.rows()}
+    jobs, why = [], {"no applicant count": 0, "50+ applicants": 0, "Director/Executive": 0,
+                     "not IT": 0, "not remote, outside Canada": 0, "duplicate": 0}
     for jid in new:
-        n, level = pages[jid]
-        if n is None:
-            unknown += 1
+        j, p = found[jid], pages[jid]
+        if p["applicants"] is None:
+            why["no applicant count"] += 1
+            continue  # maybe next time
+        remote_worldwide = not j["in_canada"]
+        reason = ("Director/Executive" if p["level"] in SENIOR_LEVELS
+                  else "not IT" if not (j["strong_it"] or p["it"])
+                  else "not remote, outside Canada" if remote_worldwide and not (j["remote_card"] or p["remote"])
+                  else "50+ applicants" if p["applicants"] >= MAX_APPLICANTS else None)
+        if reason:
+            why[reason] += 1
+            ruled_out.add(jid)  # none of these ever changes back
             continue
-        if n >= MAX_APPLICANTS or level in SENIOR_LEVELS:
-            ruled_out.add(jid)  # neither ever changes back
-            senior += level in SENIOR_LEVELS
-            continue
-        j = found[jid]
         days = days_ago(j["posted_date"])
         if days is None or days > MAX_AGE_DAYS:
             continue
-        jobs.append({**j, "level": level, "province": province_of(j["location"]), "days_ago": days,
-                     "window": window(days), "applicants": applicants_label(n),
+        key = (j["company"], j["role"], province_of(j["location"], remote_worldwide))
+        if key in listed_keys:
+            why["duplicate"] += 1
+            continue
+        listed_keys.add(key)
+        jobs.append({**j, "level": p["level"], "province": key[2],
+                     "days_ago": days, "window": window(days), "applicants": applicants_label(p["applicants"]),
                      "apply_url": f"https://www.linkedin.com/jobs/view/{jid}",
                      "checked_at": now_iso, "discovered_at": now_iso})
     jobs.sort(key=lambda j: j["days_ago"])
     tab.append(jobs)
     week = sum(j["window"] == "Last week" for j in jobs)
-    log(f"Added {len(jobs)} ({week} last week, {len(jobs) - week} last month); "
-        f"{senior} Director/Executive left out; {unknown} without an applicant count")
+    remote = sum(j["province"] == "Remote (worldwide)" for j in jobs)
+    log(f"Added {len(jobs)} ({week} last week, {len(jobs) - week} last month; {remote} remote outside Canada). "
+        f"Left out: " + ", ".join(f"{v} {k}" for k, v in why.items() if v))
 
     DATA.mkdir(exist_ok=True)
     RULED_OUT_PATH.write_text(json.dumps(sorted(ruled_out)))
